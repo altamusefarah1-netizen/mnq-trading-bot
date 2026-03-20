@@ -331,10 +331,16 @@ h2{{font-size:1rem;color:#a78bfa;margin-bottom:10px}}</style></head><body>
 
 @app.route("/status")
 def status():
-    return jsonify({"status": "online", "mode": "DEMO" if USE_DEMO else "LIVE",
-                    "open_trades": oc := sum(1 for t in open_trades.values() if t["status"]=="open"),
-                    "pending": sum(1 for t in open_trades.values() if t["status"]=="pending"),
-                    "total_signals": len(trade_log), "time": datetime.now().isoformat()})
+    open_count   = sum(1 for t in open_trades.values() if t["status"] == "open")
+    pending_count = sum(1 for t in open_trades.values() if t["status"] == "pending")
+    return jsonify({
+        "status":        "online",
+        "mode":          "DEMO" if USE_DEMO else "LIVE",
+        "open_trades":   open_count,
+        "pending":       pending_count,
+        "total_signals": len(trade_log),
+        "time":          datetime.now().isoformat()
+    })
 
 @app.route("/trades")
 def get_trades():
