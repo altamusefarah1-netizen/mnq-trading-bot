@@ -350,6 +350,32 @@ def get_trades():
 def get_logs():
     return jsonify(trade_log[-50:])
 
+@app.route("/test-auth")
+def test_auth():
+    """Test Tradovate authentication - shows exact error."""
+    try:
+        url = f"{BASE_URL}/auth/accesstokenrequest"
+        body = {
+            "name":       TRADOVATE_USERNAME,
+            "password":   TRADOVATE_PASSWORD,
+            "appId":      TRADOVATE_APP_ID,
+            "appVersion": "1.0",
+            "cid":        TRADOVATE_APP_ID,
+            "sec":        TRADOVATE_APP_SECRET,
+        }
+        r    = requests.post(url, json=body, timeout=15)
+        resp = r.json()
+        return jsonify({
+            "url":        url,
+            "username":   TRADOVATE_USERNAME,
+            "appId":      TRADOVATE_APP_ID,
+            "use_demo":   USE_DEMO,
+            "http_status": r.status_code,
+            "tradovate_response": resp,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log.info(f"🚀 Starting | Port:{port} | {'DEMO' if USE_DEMO else 'LIVE'}")
