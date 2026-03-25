@@ -1,29 +1,15 @@
 """
-MNQ Trading Bot - v7 (Pine Script Logic Match)
-================================================
-Pine Script Logic (100% waafaqsan):
-  SIGNAL   : close < open  (bearish bar)
-  ENTRY    : Sell Stop @ close - stopOffsetTicks * tickSize
-  CANCEL   : pending order > cancelAfter bars la joogo → cancel
-  SL       : entry + slTicks * tickSize      (short → SL above)
-  TP       : entry - tpTicks * tickSize      (short → TP below)
-  TRAIL    : trail_points=1t armo → trail_offset=10t SL la raro
-  STATUS   : pending → open → closed/cancelled
+MNQ Trading Bot - v7 (Pine Script 100% Match)
+==============================================
+Root cause fix: bracket was placed BEFORE fill, using signal price not fill price.
 
-State Machine (Pine array logic mirror):
-  tradeIds[]    → trades dict
-  tradeWasOpen  → trade["was_open"]
-  tradeTrailArm → trade["trail_armed"]
-  tradeSetBar   → trade["set_bar_time"]
-  tradeEntry    → trade["entry_price"]
-
-Changes from v6:
-  ✅ Bracket prices calculated FROM FILL PRICE (not signal price)
-  ✅ cancel_pending checks bar_count (Pine: bar_index - setBar > cancelAfter)
-  ✅ trail_armed action modifies SL correctly for SHORT direction
-  ✅ was_open flag mirrors Pine tradeWasOpen logic
-  ✅ No bracket attached until entry fill confirmed
-  ✅ Thread-safe state with proper cleanup
+Flow (now matches Pine exactly):
+  1. Pine bar closes bearish → short_entry webhook → Python places Sell Stop
+  2. Next bar(s): Pine detects opentrades.entry_price() fill → entry_filled webhook
+  3. Python receives fillPrice → places SL + TP bracket from ACTUAL fill price
+  4. Pine detects profit >= trailStart → trail_armed webhook → Python moves SL
+  5. Pine detects trade closed → trade_closed webhook → Python cancels other leg
+  6. Pine detects no fill after cancelAfter bars → cancel_pending → Python cancels stop
 """
 
 from flask import Flask, request, jsonify
@@ -60,38 +46,23 @@ _access_token = os.environ.get("TRADOVATE_TOKEN", "")
 _token_expiry = time.time() + 4500 if _access_token else 0
 _account_id   = None
 
-# ─── TRADE STATE (mirrors Pine Script arrays) ────────────────────────────────
-# trades[tradeId] = {
-#   "entry_order_id"  : int   — Sell Stop order ID
-#   "tp_order_id"     : int   — Limit buy order ID
-#   "sl_order_id"     : int   — Stop  buy order ID
-#   "symbol"          : str   — Tradovate symbol (e.g. MNQM5)
-#   "tv_symbol"       : str   — TradingView symbol
-#   "side"            : "Sell"|"Buy"
-#   "qty"             : int
-#   "stop_price"      : float — price the Sell Stop order fires at
-#   "fill_price"      : float — actual fill (set when was_open flips)
-#   "tp_price"        : float — calculated from fill_price
-#   "sl_price"        : float — calculated from fill_price
-#   "tp_ticks"        : int
-#   "sl_ticks"        : int
-#   "tick_size"       : float
-#   "trail_start_ticks": int
-#   "trail_dist_ticks" : int
-#   "status"          : "pending"|"open"|"closed"|"cancelled"
-#   "was_open"        : bool  — Pine: tradeWasOpen
-#   "trail_armed"     : bool  — Pine: tradeTrailArm
-#   "set_bar_time"    : float — Unix timestamp (Pine: bar_index of signal)
-#   "bar_count"       : int   — bars elapsed since signal (incremented by bar_update)
-#   "open_time"       : str
-# }
+# ─── TRADE STATE ─────────────────────────────────────────────────────────────
+# Mirrors Pine arrays exactly:
+#   tradeIds[]      → trades dict keys
+#   tradeWasOpen[]  → trade["was_open"]
+#   tradeTrailArm[] → trade["trail_armed"]
+#   tradeSetBar[]   → trade["set_bar_time"]
+#   tradeEntry[]    → trade["stop_price"]
+#
+# Key difference from v6:
+#   fill_price is set ONLY when entry_filled received from Pine
+#   bracket is placed ONLY after fill_price is known
 _state_lock = threading.Lock()
 trades      = {}
 signal_log  = []
 
 # ─── SYMBOL CONVERTER ────────────────────────────────────────────────────────
-def to_tv_sym(sym):
-    """MNQM2026 → MNQM5 (last digit of year = contract month code)"""
+def to_tradovate_sym(sym):
     forced = os.environ.get("TRADOVATE_SYMBOL", "")
     if forced:
         return forced
@@ -235,7 +206,6 @@ def _get(ep):        return _api("GET",  ep)
 def _place_sell_stop(sym, qty, stop_price):
     """
     Pine: strategy.entry("Short_N", strategy.short, stop=entryPrice)
-    Tradovate: Sell Stop order
     """
     acc = get_account_id()
     if not acc:
@@ -250,15 +220,18 @@ def _place_sell_stop(sym, qty, stop_price):
         "stopPrice":   round(stop_price, 2),
         "isAutomated": True,
     }
-    log.info(f"→ SELL STOP {qty} {sym} @ {round(stop_price, 2)}")
+    log.info(f"→ SELL STOP {qty}x {sym} @ {round(stop_price, 2)}")
     return _post("order/placeorder", body)
 
 
 def _place_bracket(sym, qty, tp_price, sl_price):
     """
     Pine: strategy.exit(loss=slTicks, profit=tpTicks)
-    Two parallel orders: Limit Buy (TP) + Stop Buy (SL)
-    Prices calculated FROM FILL PRICE — not signal close price.
+    Called ONLY after entry_filled — fill_price is known.
+
+    SHORT bracket:
+      TP = fill_price - tpTicks * tickSize  (Buy Limit below)
+      SL = fill_price + slTicks * tickSize  (Buy Stop above)
     """
     acc = get_account_id()
     if not acc:
@@ -268,6 +241,7 @@ def _place_bracket(sym, qty, tp_price, sl_price):
     sl_res = [None]
 
     def do_tp():
+        log.info(f"→ TP (Buy Limit) {qty}x {sym} @ {round(tp_price, 2)}")
         tp_res[0] = _post("order/placeorder", {
             "accountSpec": TRADOVATE_USERNAME,
             "accountId":   acc,
@@ -280,6 +254,7 @@ def _place_bracket(sym, qty, tp_price, sl_price):
         })
 
     def do_sl():
+        log.info(f"→ SL (Buy Stop)  {qty}x {sym} @ {round(sl_price, 2)}")
         sl_res[0] = _post("order/placeorder", {
             "accountSpec": TRADOVATE_USERNAME,
             "accountId":   acc,
@@ -299,8 +274,7 @@ def _place_bracket(sym, qty, tp_price, sl_price):
 
 
 def _modify_stop_order(order_id, new_stop):
-    """Move SL order to new price (used by trailing stop logic)"""
-    log.info(f"→ Modify SL #{order_id} → {new_stop}")
+    log.info(f"→ Modify SL #{order_id} → {round(new_stop, 2)}")
     return _post("order/modifyorder", {
         "orderId":   order_id,
         "orderType": "Stop",
@@ -309,12 +283,13 @@ def _modify_stop_order(order_id, new_stop):
 
 
 def _cancel_order(order_id):
+    if not order_id:
+        return {}
     log.info(f"→ Cancel order #{order_id}")
     return _post("order/cancelorder", {"orderId": order_id})
 
 
 def _market_close(sym, qty):
-    """Emergency close: Buy Market to close short"""
     acc = get_account_id()
     return _post("order/placeorder", {
         "accountSpec": TRADOVATE_USERNAME,
@@ -327,47 +302,49 @@ def _market_close(sym, qty):
     })
 
 # ═══════════════════════════════════════════════════════════════════════
-# BRACKET ATTACH (background thread — waits for fill)
+# BRACKET PLACEMENT (called from entry_filled handler)
 # ═══════════════════════════════════════════════════════════════════════
 
-def _attach_bracket_after_fill(trade_id, fill_price):
+def _place_bracket_for_trade(trade_id, fill_price):
     """
-    Pine: strategy.exit runs immediately after fill.
-    Python: we call this in a background thread once fill_price is known.
+    This is the ONLY place brackets are placed.
+    Called after Pine confirms the entry filled with actual fill price.
 
-    SHORT direction:
-      SL = fill_price + sl_ticks * tick_size   (above entry)
-      TP = fill_price - tp_ticks * tick_size   (below entry)
+    SHORT:
+      SL = fill_price + sl_ticks * tick_size   (above entry — cuts loss)
+      TP = fill_price - tp_ticks * tick_size   (below entry — takes profit)
     """
     with _state_lock:
         trade = trades.get(trade_id)
     if not trade:
-        log.warning(f"attach_bracket: {trade_id} not found")
+        log.warning(f"place_bracket: {trade_id} not found")
         return
 
-    ts        = trade["tick_size"]
-    sl_ticks  = trade["sl_ticks"]
-    tp_ticks  = trade["tp_ticks"]
-    sym       = trade["symbol"]
-    qty       = trade["qty"]
-    side      = trade["side"]
+    ts       = trade["tick_size"]
+    side     = trade["side"]
+    sl_ticks = trade["sl_ticks"]
+    tp_ticks = trade["tp_ticks"]
+    sym      = trade["symbol"]
+    qty      = trade["qty"]
 
-    if side == "Sell":
-        # SHORT: SL above, TP below
+    if side == "Sell":                                # SHORT
         sl_price = round(fill_price + sl_ticks * ts, 2)
         tp_price = round(fill_price - tp_ticks * ts, 2)
-    else:
-        # LONG: SL below, TP above
+    else:                                             # LONG
         sl_price = round(fill_price - sl_ticks * ts, 2)
         tp_price = round(fill_price + tp_ticks * ts, 2)
 
-    log.info(f"Bracket [{trade_id}] fill={fill_price} "
-             f"TP={tp_price} SL={sl_price}")
+    log.info(f"🎯 Bracket [{trade_id}] fill={fill_price} "
+             f"SL={sl_price} TP={tp_price}")
 
     tp_r, sl_r = _place_bracket(sym, qty, tp_price, sl_price)
     tp_id = tp_r.get("orderId")
     sl_id = sl_r.get("orderId")
-    log.info(f"Bracket placed [{trade_id}] tp_id={tp_id} sl_id={sl_id}")
+
+    if not tp_id and not sl_id:
+        log.error(f"❌ BRACKET FAILED [{trade_id}] tp={tp_r} sl={sl_r}")
+    else:
+        log.info(f"✅ Bracket OK [{trade_id}] tp_id={tp_id} sl_id={sl_id}")
 
     with _state_lock:
         if trade_id in trades:
@@ -377,45 +354,38 @@ def _attach_bracket_after_fill(trade_id, fill_price):
                 "sl_order_id": sl_id,
                 "tp_price":    tp_price,
                 "sl_price":    sl_price,
-                "status":      "open",
-                "was_open":    True,
             })
 
 # ═══════════════════════════════════════════════════════════════════════
-# STATE HELPERS
+# STATE
 # ═══════════════════════════════════════════════════════════════════════
 
 def _new_trade(trade_id, entry_oid, sym, tv_sym,
                side, qty, stop_price,
                tp_ticks, sl_ticks, tick_size,
                trail_start_ticks, trail_dist_ticks):
-    """
-    Pine: array.push(tradeIds, tradeCounter) etc.
-    Creates pending trade — bracket NOT yet set (needs fill price).
-    """
     with _state_lock:
         trades[trade_id] = {
             "entry_order_id":    entry_oid,
-            "tp_order_id":       None,
-            "sl_order_id":       None,
+            "tp_order_id":       None,      # set after entry_filled
+            "sl_order_id":       None,      # set after entry_filled
             "symbol":            sym,
             "tv_symbol":         tv_sym,
             "side":              side,
             "qty":               qty,
             "stop_price":        stop_price,
-            "fill_price":        None,
-            "tp_price":          None,
-            "sl_price":          None,
+            "fill_price":        None,      # set after entry_filled
+            "tp_price":          None,      # set after entry_filled
+            "sl_price":          None,      # set after entry_filled
             "tp_ticks":          tp_ticks,
             "sl_ticks":          sl_ticks,
             "tick_size":         tick_size,
             "trail_start_ticks": trail_start_ticks,
             "trail_dist_ticks":  trail_dist_ticks,
-            "status":            "pending",
-            "was_open":          False,   # Pine: tradeWasOpen
-            "trail_armed":       False,   # Pine: tradeTrailArm
-            "set_bar_time":      time.time(),  # Pine: tradeSetBar (bar_index)
-            "bar_count":         0,            # bars since signal
+            "status":            "pending",  # pending → open → closed/cancelled
+            "was_open":          False,       # Pine: tradeWasOpen
+            "trail_armed":       False,       # Pine: tradeTrailArm
+            "set_bar_time":      time.time(),
             "open_time":         datetime.now().isoformat(),
         }
 
@@ -433,181 +403,139 @@ def _log_signal(action, trade_id, sym, result):
             signal_log.pop(0)
 
 # ═══════════════════════════════════════════════════════════════════════
-# WEBHOOK
+# WEBHOOK  — main handler
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         data = request.get_json(force=True)
-        log.info(f"📨 Webhook: {data}")
+        log.info(f"📨 {data}")
 
         if data.get("secret") != WEBHOOK_SECRET:
             return jsonify({"error": "unauthorized"}), 401
 
-        action   = data.get("action", "")
-        tv_sym   = data.get("symbol", "MNQM2026")
-        sym      = to_tv_sym(tv_sym)
-        qty      = int(data.get("qty", 1))
-        tp_ticks = int(data.get("tpTicks",  120))
-        sl_ticks = int(data.get("slTicks",   15))
-        stop_off = int(data.get("stopOffset", 2))
-        trade_id = data.get("tradeId", f"T_{int(time.time())}")
-        tick_size= float(data.get("tickSize", 0.25))
-        price    = float(data.get("price", 0))
-        trail_start = int(data.get("trailStart", 1))
-        trail_dist  = int(data.get("trailDist",  10))
-        result   = {}
+        action    = data.get("action", "")
+        tv_sym    = data.get("symbol", "MNQM2026")
+        sym       = to_tradovate_sym(tv_sym)
+        qty       = int(data.get("qty", 1))
+        trade_id  = data.get("tradeId", f"T_{int(time.time())}")
+        tick_size = float(data.get("tickSize", 0.25))
+        price     = float(data.get("price", 0))
+        result    = {}
 
-        # ── SHORT ENTRY ──────────────────────────────────────────────────
-        # Pine: strategy.entry("Short_N", strategy.short, stop=close - stopOff*tick)
+        # ─────────────────────────────────────────────────────────────
+        # 1. SHORT ENTRY
+        #    Pine fires when: close < open (bearish bar)
+        #    Action: place Sell Stop order
+        #    Bracket: NOT placed here — wait for entry_filled
+        # ─────────────────────────────────────────────────────────────
         if action == "short_entry":
-            order_type = data.get("orderType", "Stop")
+            tp_ticks    = int(data.get("tpTicks",  120))
+            sl_ticks    = int(data.get("slTicks",   15))
+            stop_off    = int(data.get("stopOffset", 2))
+            trail_start = int(data.get("trailStart", 1))
+            trail_dist  = int(data.get("trailDist",  10))
 
-            if order_type == "Stop":
-                # Sell Stop = price dropped below this level → fill
-                stop_price = round(price - stop_off * tick_size, 2)
-                res = _place_sell_stop(sym, qty, stop_price)
+            stop_price = round(price - stop_off * tick_size, 2)
+            res = _place_sell_stop(sym, qty, stop_price)
 
-                if "orderId" in res:
-                    oid = res["orderId"]
-                    _new_trade(
-                        trade_id, oid, sym, tv_sym,
-                        "Sell", qty, stop_price,
-                        tp_ticks, sl_ticks, tick_size,
-                        trail_start, trail_dist
-                    )
-                    # NOTE: bracket is NOT placed here.
-                    # Pine places strategy.exit immediately, but in reality
-                    # it only fires AFTER the entry fills.
-                    # We wait for "entry_filled" or "trail_armed" to learn fill price.
-                    result = {
-                        "orderId":   oid,
-                        "stopPrice": stop_price,
-                        "bracket":   "waiting_for_fill"
-                    }
-                else:
-                    result = res
-
-            elif order_type == "Market":
-                # Immediate fill at market
-                acc = get_account_id()
-                res = _post("order/placeorder", {
-                    "accountSpec": TRADOVATE_USERNAME,
-                    "accountId":   acc,
-                    "action":      "Sell",
-                    "symbol":      sym,
-                    "orderQty":    qty,
-                    "orderType":   "Market",
-                    "isAutomated": True,
-                })
-                if "orderId" in res:
-                    oid = res["orderId"]
-                    _new_trade(
-                        trade_id, oid, sym, tv_sym,
-                        "Sell", qty, price,
-                        tp_ticks, sl_ticks, tick_size,
-                        trail_start, trail_dist
-                    )
-                    # Market fill → attach bracket immediately using signal price
-                    threading.Thread(
-                        target=_attach_bracket_after_fill,
-                        args=(trade_id, price),
-                        daemon=True
-                    ).start()
-                    result = {"orderId": oid, "bracket": "queued"}
-                else:
-                    result = res
-
-        # ── LONG ENTRY ──────────────────────────────────────────────────
-        elif action == "long_entry":
-            acc = get_account_id()
-            res = _post("order/placeorder", {
-                "accountSpec": TRADOVATE_USERNAME,
-                "accountId":   acc,
-                "action":      "Buy",
-                "symbol":      sym,
-                "orderQty":    qty,
-                "orderType":   "Market",
-                "isAutomated": True,
-            })
             if "orderId" in res:
                 oid = res["orderId"]
                 _new_trade(
                     trade_id, oid, sym, tv_sym,
-                    "Buy", qty, price,
+                    "Sell", qty, stop_price,
                     tp_ticks, sl_ticks, tick_size,
                     trail_start, trail_dist
                 )
-                threading.Thread(
-                    target=_attach_bracket_after_fill,
-                    args=(trade_id, price),
-                    daemon=True
-                ).start()
-                result = {"orderId": oid, "bracket": "queued"}
+                result = {
+                    "orderId":   oid,
+                    "stopPrice": stop_price,
+                    "bracket":   "waiting_for_entry_filled"
+                }
+                log.info(f"⏳ Pending [{trade_id}] stop@{stop_price} — "
+                         f"bracket held until Pine confirms fill")
             else:
                 result = res
 
-        # ── ENTRY FILLED ─────────────────────────────────────────────────
-        # Pine: isOpen = true (tradeWasOpen flips false→true)
-        # Send this from a fill-monitoring webhook or broker callback.
-        # Payload: { action:"entry_filled", tradeId:"Short_N", fillPrice:21450.25 }
+        # ─────────────────────────────────────────────────────────────
+        # 2. ENTRY FILLED  ← KEY FIX
+        #    Pine fires when: strategy.opentrades.entry_id(j) == entryId
+        #                     (tradeWasOpen flips false → true)
+        #    fillPrice = strategy.opentrades.entry_price(j)  ← actual fill
+        #    Action: place SL + TP bracket from REAL fill price
+        # ─────────────────────────────────────────────────────────────
         elif action == "entry_filled":
             fill_price = float(data.get("fillPrice", 0))
+
             with _state_lock:
                 trade = trades.get(trade_id)
 
             if not trade:
                 result = {"error": f"{trade_id} not found"}
             elif trade["was_open"]:
-                result = {"info": "already_open"}
+                result = {"info": "already_processed"}
+            elif fill_price <= 0:
+                result = {"error": "fillPrice missing or zero"}
             else:
-                # mirrors: array.set(tradeWasOpen, i, true)
+                # Mark open (mirrors Pine tradeWasOpen = true)
                 with _state_lock:
                     if trade_id in trades:
                         trades[trade_id]["was_open"] = True
                         trades[trade_id]["status"]   = "open"
-                # attach bracket with ACTUAL fill price
+
+                # Place bracket from ACTUAL fill price in background
                 threading.Thread(
-                    target=_attach_bracket_after_fill,
+                    target=_place_bracket_for_trade,
                     args=(trade_id, fill_price),
                     daemon=True
                 ).start()
-                result = {"filled": trade_id, "fillPrice": fill_price}
 
-        # ── TRAILING STOP ARMED ───────────────────────────────────────────
-        # Pine: trail_points=trailStartTicks, trail_offset=trailDistanceTicks
-        # Pine arms trailing when price moves trailStartTicks in profit.
-        # We receive current price; calculate new SL and modify the order.
+                result = {
+                    "trade_id":  trade_id,
+                    "fillPrice": fill_price,
+                    "bracket":   "placing"
+                }
+                log.info(f"🟢 Fill confirmed [{trade_id}] @ {fill_price} "
+                         f"— bracket thread started")
+
+        # ─────────────────────────────────────────────────────────────
+        # 3. TRAIL ARMED
+        #    Pine fires when: profitTicks >= trailStartTicks
+        #    Action: move SL to currentPrice + trailDist * tickSize
         #
-        # SHORT direction:
-        #   trail_armed when: fill_price - cur_price >= trail_start_ticks * tick_size
-        #   new SL = cur_price + trail_dist_ticks * tick_size
+        #    SHORT direction:
+        #      price going DOWN = profit
+        #      trailing SL = currentPrice + trailDist (stays above mkt)
+        # ─────────────────────────────────────────────────────────────
         elif action == "trail_armed":
-            cur_price = float(data.get("currentPrice", 0))
+            cur_price  = float(data.get("currentPrice", 0))
+            trail_dist = int(data.get("trailDist", 10))
+
             with _state_lock:
                 trade = trades.get(trade_id)
 
             if not trade:
                 result = {"error": f"{trade_id} not found"}
             elif not trade.get("sl_order_id"):
-                # Bracket not yet placed — store trail info, apply when bracket arrives
+                # Bracket not yet placed (race: entry_filled thread still running)
+                # Store request — a follow-up call can reapply
                 with _state_lock:
                     if trade_id in trades:
-                        trades[trade_id]["trail_armed"]       = True
-                        trades[trade_id]["trail_armed_price"]  = cur_price
-                result = {"info": "trail_noted_pending_bracket"}
+                        trades[trade_id]["trail_armed"]        = True
+                        trades[trade_id]["pending_trail_price"] = cur_price
+                log.warning(f"⚠️  Trail armed before bracket — stored [{trade_id}]")
+                result = {"info": "trail_stored_bracket_pending"}
             else:
-                ts         = trade["tick_size"]
-                side       = trade["side"]
-                sl_id      = trade["sl_order_id"]
-                trail_d    = trade["trail_dist_ticks"]
+                ts   = trade["tick_size"]
+                side = trade["side"]
+                sl_id = trade["sl_order_id"]
 
-                # SHORT: SL moves down with price (stays above current)
+                # SHORT: new SL above current price
                 if side == "Sell":
-                    new_sl = round(cur_price + trail_d * ts, 2)
+                    new_sl = round(cur_price + trail_dist * ts, 2)
                 else:
-                    new_sl = round(cur_price - trail_d * ts, 2)
+                    new_sl = round(cur_price - trail_dist * ts, 2)
 
                 res = _modify_stop_order(sl_id, new_sl)
                 with _state_lock:
@@ -615,11 +543,15 @@ def webhook():
                         trades[trade_id]["sl_price"]    = new_sl
                         trades[trade_id]["trail_armed"] = True
 
-                result = {"newSL": new_sl, "modifyRes": res}
+                result = {"newSL": new_sl, "res": res}
+                log.info(f"🟣 Trail armed [{trade_id}] SL→{new_sl}")
 
-        # ── CANCEL PENDING ────────────────────────────────────────────────
-        # Pine: (bar_index - setBar) > cancelAfter → strategy.cancel(entryId)
-        # Pine sends this alert after cancelAfter bars with no fill.
+        # ─────────────────────────────────────────────────────────────
+        # 4. CANCEL PENDING
+        #    Pine fires when: (bar_index - setBar) > cancelAfter
+        #                     AND trade not yet filled
+        #    Action: cancel the Sell Stop entry order
+        # ─────────────────────────────────────────────────────────────
         elif action == "cancel_pending":
             with _state_lock:
                 trade = trades.get(trade_id)
@@ -627,57 +559,49 @@ def webhook():
             if not trade:
                 result = {"info": "not_found"}
             elif trade["status"] != "pending":
-                result = {"info": f"status_is_{trade['status']}_not_pending"}
+                # Already filled or already cancelled — ignore
+                result = {"info": f"status={trade['status']} not pending — skip"}
+                log.info(f"Cancel skip [{trade_id}] status={trade['status']}")
             else:
-                # Cancel the Sell Stop entry order
                 cancel_res = _cancel_order(trade["entry_order_id"])
                 with _state_lock:
                     if trade_id in trades:
                         trades[trade_id]["status"] = "cancelled"
-                log.info(f"Cancelled pending [{trade_id}]")
                 result = {"cancelled": trade_id, "res": cancel_res}
+                log.info(f"🚫 Cancelled pending [{trade_id}]")
 
-        # ── TRADE CLOSED ──────────────────────────────────────────────────
-        # Pine: isOpen=false AND wasOpen=true → trade closed (TP/SL/Trail)
-        # Send from broker callback or order-fill monitoring.
-        # Payload: { action:"trade_closed", tradeId:"Short_N", closeReason:"TP"|"SL"|"Trail" }
+        # ─────────────────────────────────────────────────────────────
+        # 5. TRADE CLOSED
+        #    Pine fires when: not isOpen AND wasOpen
+        #    (TP / SL / Trailing stop hit)
+        #    Action: cancel surviving bracket leg
+        # ─────────────────────────────────────────────────────────────
         elif action == "trade_closed":
             close_reason = data.get("closeReason", "unknown")
+
             with _state_lock:
                 trade = trades.get(trade_id)
 
             if not trade:
                 result = {"info": "not_found"}
             else:
-                # Cancel the surviving bracket leg
+                # Cancel whichever bracket leg is still open
                 if trade.get("tp_order_id"):
                     _cancel_order(trade["tp_order_id"])
                 if trade.get("sl_order_id"):
                     _cancel_order(trade["sl_order_id"])
+
                 with _state_lock:
                     if trade_id in trades:
                         trades[trade_id]["status"]       = "closed"
                         trades[trade_id]["close_reason"] = close_reason
-                log.info(f"Trade closed [{trade_id}] reason={close_reason}")
+
                 result = {"closed": trade_id, "reason": close_reason}
+                log.info(f"🔴 Closed [{trade_id}] reason={close_reason}")
 
-        # ── BAR UPDATE ────────────────────────────────────────────────────
-        # Pine: each bar the management loop runs.
-        # Optional: send { action:"bar_update" } each bar from Pine to
-        # increment bar_count for pending trades (for cancel logic reference).
-        elif action == "bar_update":
-            updated = []
-            with _state_lock:
-                for tid, t in trades.items():
-                    if t["status"] == "pending":
-                        t["bar_count"] += 1
-                        updated.append({
-                            "tradeId":   tid,
-                            "bar_count": t["bar_count"]
-                        })
-            result = {"updated_pending": updated}
-
-        # ── CLOSE ALL ─────────────────────────────────────────────────────
+        # ─────────────────────────────────────────────────────────────
+        # 6. CLOSE ALL — emergency
+        # ─────────────────────────────────────────────────────────────
         elif action == "close_all":
             closed = []
             with _state_lock:
@@ -686,11 +610,11 @@ def webhook():
                     if t["status"] in ("open", "pending")
                 }
             for tid, t in open_trades.items():
-                if t.get("tp_order_id"): _cancel_order(t["tp_order_id"])
-                if t.get("sl_order_id"): _cancel_order(t["sl_order_id"])
-                if t.get("entry_order_id") and t["status"] == "pending":
-                    _cancel_order(t["entry_order_id"])
-                if t["status"] == "open":
+                _cancel_order(t.get("tp_order_id"))
+                _cancel_order(t.get("sl_order_id"))
+                if t["status"] == "pending":
+                    _cancel_order(t.get("entry_order_id"))
+                else:
                     _market_close(t["symbol"], t["qty"])
                 with _state_lock:
                     if tid in trades:
@@ -698,7 +622,6 @@ def webhook():
                 closed.append(tid)
             result = {"closed": closed}
 
-        # ── SESSION END — ignored (Pine: no session filter) ───────────────
         elif action == "session_end":
             result = {"info": "session_filter_OFF — ignored"}
 
@@ -731,7 +654,7 @@ def set_token():
         _token_expiry = time.time() + 4500
         _account_id   = None
     log.info("✅ Token updated via /set-token")
-    return jsonify({"status": "ok", "message": "Token updated"})
+    return jsonify({"status": "ok"})
 
 
 @app.route("/test-auth")
@@ -743,8 +666,6 @@ def test_auth():
         "token_status":   "✅ Active" if tok_ok else "⚠️ Expired/Missing",
         "account_status": f"✅ Account: {acc}" if acc else "❌ No account",
         "token_preview":  (tok[:30] + "...") if tok else None,
-        "token_expires":  datetime.fromtimestamp(_token_expiry).isoformat()
-                          if _token_expiry else None,
         "use_demo":       USE_DEMO,
         "username":       TRADOVATE_USERNAME,
         "active_trades":  sum(1 for t in trades.values()
@@ -800,76 +721,53 @@ def dashboard():
                if _token_expiry else "—")
 
     html = f"""<!DOCTYPE html><html><head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MNQ Bot v7</title>
-<meta http-equiv="refresh" content="5">
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MNQ Bot v7</title><meta http-equiv="refresh" content="5">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{font-family:system-ui,sans-serif;background:#07070f;color:#dde0f0;padding:18px}}
 h1{{font-size:1.35rem;color:#a78bfa;margin-bottom:2px}}
 .sub{{font-size:.76rem;color:#555870;margin-bottom:12px}}
-.row{{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:16px}}
+.row{{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px}}
 .badge{{padding:3px 11px;border-radius:20px;font-size:.72rem;font-weight:700}}
-.bd{{background:#162033;color:#60a5fa}}
-.bl{{background:#200f0f;color:#f87171}}
-.bg{{background:#071a10;color:#34d399}}
-.bw{{background:#1f1500;color:#fbbf24}}
-.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;margin-bottom:20px}}
+.bd{{background:#162033;color:#60a5fa}}.bl{{background:#200f0f;color:#f87171}}
+.bg{{background:#071a10;color:#34d399}}.bw{{background:#1f1500;color:#fbbf24}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;margin-bottom:18px}}
 .card{{background:#0f0f20;border:1px solid #1e1e35;border-radius:9px;padding:12px}}
 .card .lbl{{font-size:.65rem;color:#555870;margin-bottom:4px;text-transform:uppercase;letter-spacing:.06em}}
 .card .val{{font-size:1.55rem;font-weight:800}}
 .g{{color:#34d399}}.b{{color:#60a5fa}}.y{{color:#fbbf24}}
 .o{{color:#fb923c}}.r{{color:#f87171}}.p{{color:#a78bfa}}
-table{{width:100%;border-collapse:collapse;background:#0f0f20;border-radius:9px;
-       overflow:hidden;margin-bottom:18px;font-size:.78rem}}
-th{{background:#161628;padding:8px 11px;text-align:left;font-size:.65rem;
-    color:#555870;text-transform:uppercase;letter-spacing:.06em}}
+table{{width:100%;border-collapse:collapse;background:#0f0f20;border-radius:9px;overflow:hidden;margin-bottom:18px;font-size:.78rem}}
+th{{background:#161628;padding:8px 11px;text-align:left;font-size:.65rem;color:#555870;text-transform:uppercase;letter-spacing:.06em}}
 td{{padding:7px 11px;border-top:1px solid #161628}}
-.s-open{{color:#34d399;font-weight:700}}
-.s-pending{{color:#fbbf24;font-weight:700}}
-.s-closed{{color:#444860}}
-.s-cancelled{{color:#ef4444}}
+.s-open{{color:#34d399;font-weight:700}}.s-pending{{color:#fbbf24;font-weight:700}}
+.s-closed{{color:#444860}}.s-cancelled{{color:#ef4444}}
 h2{{font-size:.82rem;color:#a78bfa;margin-bottom:8px;text-transform:uppercase;letter-spacing:.1em}}
-.cfg{{background:#0f0f20;border:1px solid #1e1e35;border-radius:9px;
-      padding:12px 14px;margin-bottom:18px;font-size:.78rem;line-height:2}}
+.cfg{{background:#0f0f20;border:1px solid #1e1e35;border-radius:9px;padding:10px 14px;margin-bottom:14px;font-size:.76rem;line-height:1.9}}
 .cfg b{{color:#a78bfa}}
-.diff{{background:#0a1a0a;border:1px solid #1e3a1e;border-radius:9px;
-       padding:12px 14px;margin-bottom:18px;font-size:.76rem;line-height:1.9}}
-.diff .ok{{color:#34d399}}.diff .fix{{color:#fbbf24}}.diff .label{{color:#555870}}
+.fix-box{{background:#071a10;border:1px solid #0f3a1e;border-radius:9px;padding:10px 14px;margin-bottom:14px;font-size:.74rem;line-height:1.9;color:#34d399}}
+.fix-box span{{color:#555870}}
 </style></head><body>
-<h1>MNQ Bot <span style="font-size:.85rem;color:#60a5fa">v7</span>
-    <span style="font-size:.7rem;color:#34d399;margin-left:8px">Pine Script 100% Match</span>
-</h1>
+<h1>MNQ Bot <span style="font-size:.85rem;color:#60a5fa">v7</span></h1>
 <p class="sub">Refresh 5s · {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
 <div class="row">
   <span class="badge {'bd' if USE_DEMO else 'bl'}">{'DEMO' if USE_DEMO else 'LIVE'}</span>
-  <span class="badge {'bg' if tok_ok else 'bw'}">
-    TOKEN {'✅' if tok_ok else '⚠️'} · exp {exp_str}
-  </span>
+  <span class="badge {'bg' if tok_ok else 'bw'}">TOKEN {'✅' if tok_ok else '⚠️'} · exp {exp_str}</span>
 </div>
-
-<div class="diff">
-  <span class="label">v7 FIXES vs v6 ── </span>
-  <span class="ok">✅ Bracket price from FILL (not signal close)</span> &nbsp;|&nbsp;
-  <span class="ok">✅ Cancel only when pending + bar_count &gt; cancelAfter</span> &nbsp;|&nbsp;
-  <span class="ok">✅ Trail: SHORT = SL moves DOWN with price</span> &nbsp;|&nbsp;
-  <span class="ok">✅ entry_filled action for stop order fills</span> &nbsp;|&nbsp;
-  <span class="ok">✅ was_open / trail_armed mirror Pine arrays</span>
+<div class="fix-box">
+  <span>Root cause fix: </span>
+  ✅ Bracket placed ONLY after <b style="color:#60a5fa">entry_filled</b> webhook (fill price from Pine)
+  &nbsp;·&nbsp; ✅ SL/TP from actual fill price, not signal close
+  &nbsp;·&nbsp; ✅ Cancel only when status=pending
 </div>
-
 <div class="cfg">
   <b>Pine Logic:</b> &nbsp;
-  Signal: close &lt; open (bearish bar) &nbsp;|&nbsp;
-  Sell Stop: close − 2t &nbsp;|&nbsp;
-  Cancel: 2 bars &nbsp;|&nbsp;
-  SL: +15t from fill &nbsp;|&nbsp;
-  TP: −120t from fill &nbsp;|&nbsp;
-  Trail start 1t · dist 10t &nbsp;|&nbsp;
-  BE <span style="color:#ef4444">OFF</span> &nbsp;|&nbsp;
-  Session <span style="color:#ef4444">OFF</span>
+  Signal: close &lt; open &nbsp;|&nbsp; Sell Stop: close−2t &nbsp;|&nbsp;
+  Cancel: 2 bars &nbsp;|&nbsp; SL: fill+15t &nbsp;|&nbsp; TP: fill−120t &nbsp;|&nbsp;
+  Trail: 1t start · 10t dist &nbsp;|&nbsp;
+  BE <span style="color:#ef4444">OFF</span> &nbsp;|&nbsp; Session <span style="color:#ef4444">OFF</span>
 </div>
-
 <div class="cards">
   <div class="card"><div class="lbl">Open</div><div class="val g">{open_c}</div></div>
   <div class="card"><div class="lbl">Pending</div><div class="val o">{pend_c}</div></div>
@@ -877,13 +775,10 @@ h2{{font-size:.82rem;color:#a78bfa;margin-bottom:8px;text-transform:uppercase;le
   <div class="card"><div class="lbl">Signals</div><div class="val y">{len(signal_log)}</div></div>
   <div class="card"><div class="lbl">Bot</div><div class="val g">ON</div></div>
 </div>
-
 <h2>Active Trades ({open_c + pend_c})</h2>
 <table><tr>
-  <th>Trade ID</th><th>Sym</th><th>Side</th>
-  <th>Stop Px</th><th>Fill Px</th>
-  <th>TP ✅</th><th>SL 🛑</th>
-  <th>Status</th><th>Bars</th><th>Trail</th>
+  <th>Trade ID</th><th>Sym</th><th>Stop Px</th><th>Fill Px</th>
+  <th>TP ✅</th><th>SL 🛑</th><th>Status</th><th>Trail</th>
 </tr>"""
 
     active = sorted(
@@ -893,39 +788,38 @@ h2{{font-size:.82rem;color:#a78bfa;margin-bottom:8px;text-transform:uppercase;le
     )
     for tid, t in active[:60]:
         sc = f"s-{t['status']}"
+        fill_disp = t.get("fill_price") or "⏳"
+        tp_disp   = t.get("tp_price")   or ("⏳" if t["status"]=="open" else "—")
+        sl_disp   = t.get("sl_price")   or ("⏳" if t["status"]=="open" else "—")
         html += f"""<tr>
 <td class="p" style="font-size:.7rem">{tid}</td>
 <td>{t['symbol']}</td>
-<td style="color:{'#f87171' if t['side']=='Sell' else '#34d399'}">{t['side']}</td>
 <td class="y">{t.get('stop_price','—')}</td>
-<td class="b">{t.get('fill_price') or '—'}</td>
-<td class="g">{t.get('tp_price') or '—'}</td>
-<td class="r">{t.get('sl_price') or '—'}</td>
+<td class="b">{fill_disp}</td>
+<td class="g">{tp_disp}</td>
+<td class="r">{sl_disp}</td>
 <td class="{sc}">{t['status'].upper()}</td>
-<td class="o">{t.get('bar_count',0)}</td>
 <td>{'✅' if t.get('trail_armed') else '—'}</td>
 </tr>"""
 
     if not active:
-        html += ("<tr><td colspan='10' style='color:#555870;"
+        html += ("<tr><td colspan='8' style='color:#555870;"
                  "text-align:center;padding:18px'>No active trades</td></tr>")
 
     html += ("</table><h2>Signal Log</h2><table><tr>"
              "<th>Time</th><th>Action</th><th>Trade ID</th>"
              "<th>Symbol</th><th>Result</th></tr>")
 
-    action_colors = {
+    ac_colors = {
         "short_entry":    "#f87171",
-        "long_entry":     "#34d399",
         "entry_filled":   "#60a5fa",
         "trail_armed":    "#a78bfa",
         "cancel_pending": "#fbbf24",
         "trade_closed":   "#555870",
         "close_all":      "#fb923c",
-        "bar_update":     "#333550",
     }
     for e in logs:
-        ac = action_colors.get(e["action"], "#dde0f0")
+        ac = ac_colors.get(e["action"], "#dde0f0")
         html += f"""<tr>
 <td style="color:#555870">{e['time'][11:19]}</td>
 <td style="color:{ac};font-weight:600">{e['action']}</td>
@@ -938,9 +832,6 @@ h2{{font-size:.82rem;color:#a78bfa;margin-bottom:8px;text-transform:uppercase;le
     return html
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log.info(f"🚀 MNQ Bot v7 | Port:{port} | {'DEMO' if USE_DEMO else 'LIVE'}")
