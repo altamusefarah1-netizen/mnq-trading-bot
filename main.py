@@ -413,14 +413,42 @@ def register_trade(trade_id: str, entry_order_id: int,
     log.info(f"✅ Trade registered: {trade_id} @ {entry_price}")
 
 
+def get_fill_price(order_id: int, timeout: float = 8.0) -> float | None:
+    """
+    Poll Tradovate until the order is filled, then return the actual fill price.
+    Polls every 0.4s for up to `timeout` seconds.
+    Returns None if not filled within timeout.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            result = _api_get(f"order/item?id={order_id}")
+            status = result.get("ordStatus", "")
+            if status == "Filled":
+                # avgFillPrice is the actual execution price
+                fill = result.get("avgFillPrice")
+                if fill:
+                    log.info(f"✅ Fill confirmed: order #{order_id} @ {fill}")
+                    return float(fill)
+        except Exception as e:
+            log.warning(f"Fill poll error: {e}")
+        time.sleep(0.4)
+    log.warning(f"⚠️ Fill poll timeout for order #{order_id} — using estimated price")
+    return None
+
+
 def attach_bracket_to_trade(trade_id: str, entry_price: float, qty: int):
     """
     Runs in background thread.
     Mirrors: strategy.exit(exitId, loss=slTicks, profit=tpTicks)
 
+    IMPORTANT: For Sell Stop orders we POLL for the actual fill price
+    before placing the bracket — this ensures SL/TP are calculated
+    from the real execution price, not the estimated stop price.
+
     For SHORT:
-      TP = entry - (TP_TICKS  * TICK_SIZE)
-      SL = entry + (SL_TICKS  * TICK_SIZE)
+      TP = fill_price - (TP_TICKS * TICK_SIZE)
+      SL = fill_price + (SL_TICKS * TICK_SIZE)
     """
     with _state_lock:
         trade = trades.get(trade_id)
@@ -428,9 +456,22 @@ def attach_bracket_to_trade(trade_id: str, entry_price: float, qty: int):
         log.error(f"attach_bracket: {trade_id} not found in registry")
         return
 
-    symbol   = trade["symbol"]
-    tp_price = round(entry_price - TP_TICKS * TICK_SIZE, 2)
-    sl_price = round(entry_price + SL_TICKS * TICK_SIZE, 2)
+    symbol    = trade["symbol"]
+    order_id  = trade.get("entryOrderId")
+
+    # ── Poll for actual fill price ────────────────────────────────────────
+    fill_price = None
+    if order_id:
+        fill_price = get_fill_price(order_id, timeout=10.0)
+
+    # Fall back to estimated price if poll times out
+    actual_price = fill_price if fill_price else entry_price
+    log.info(f"Bracket [{trade_id}] using price={actual_price} "
+             f"(fill={'real' if fill_price else 'estimated'})")
+
+    # ── Calculate TP and SL from actual fill price ────────────────────────
+    tp_price = round(actual_price - TP_TICKS * TICK_SIZE, 2)
+    sl_price = round(actual_price + SL_TICKS * TICK_SIZE, 2)
 
     tp_r, sl_r = place_bracket(symbol, qty, tp_price, sl_price)
     tp_id = tp_r.get("orderId")
@@ -439,13 +480,15 @@ def attach_bracket_to_trade(trade_id: str, entry_price: float, qty: int):
     with _state_lock:
         if trade_id in trades:
             trades[trade_id].update({
-                "tpOrderId": tp_id,
-                "slOrderId": sl_id,
-                "tpPrice":   tp_price,
-                "slPrice":   sl_price,
-                "status":    "open" if (tp_id or sl_id) else "pending",
+                "entryPrice": actual_price,   # update with real fill price
+                "tpOrderId":  tp_id,
+                "slOrderId":  sl_id,
+                "tpPrice":    tp_price,
+                "slPrice":    sl_price,
+                "status":     "open" if (tp_id or sl_id) else "pending",
             })
-    log.info(f"✅ Bracket attached [{trade_id}] TP={tp_id}@{tp_price} SL={sl_id}@{sl_price}")
+    log.info(f"✅ Bracket [{trade_id}] fill@{actual_price} "
+             f"TP={tp_id}@{tp_price} SL={sl_id}@{sl_price}")
 
 
 def log_signal(action: str, trade_id: str, symbol: str, result):
