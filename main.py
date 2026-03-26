@@ -183,6 +183,67 @@ def _refresh_loop():
 
 threading.Thread(target=_refresh_loop, daemon=True).start()
 
+
+def _position_monitor():
+    """
+    Runs every 10 seconds.
+    Detects any pending trade whose Sell Stop actually filled
+    (i.e. there is a real open position in Tradovate) but
+    entry_filled webhook never arrived (same-bar fill race).
+    Places bracket automatically using avg fill price from API.
+    """
+    time.sleep(30)          # wait for startup
+    while True:
+        try:
+            # Only run if there are pending trades
+            with _state_lock:
+                pending = {
+                    tid: dict(t) for tid, t in trades.items()
+                    if t["status"] == "pending"
+                }
+
+            if pending:
+                positions = get("position/list")
+                if isinstance(positions, list):
+                    # Map contractId → avgPrice for non-zero positions
+                    pos_map = {}
+                    for p in positions:
+                        if _i(p.get("netPos", 0)) != 0:
+                            pos_map[_s(p.get("contractId", ""))] = _f(p.get("avgPrice", 0))
+
+                    if pos_map:
+                        # For each pending trade, check if symbol has open position
+                        for tid, trade in pending.items():
+                            sym = _s(trade.get("symbol", ""))
+                            # Look up contractId for this symbol
+                            info = get(f"contract/find?name={sym}")
+                            if isinstance(info, dict) and "id" in info:
+                                cid = _s(info["id"])
+                                if cid in pos_map:
+                                    fill_p = pos_map[cid]
+                                    if fill_p > 0:
+                                        log.info(
+                                            f"📡 Monitor: detected fill [{tid}]"
+                                            f" @ {fill_p} — placing bracket"
+                                        )
+                                        with _state_lock:
+                                            if tid in trades:
+                                                trades[tid]["was_open"]   = True
+                                                trades[tid]["status"]     = "open"
+                                                trades[tid]["fill_price"] = fill_p
+                                        threading.Thread(
+                                            target=place_bracket_for_trade,
+                                            args=(tid, fill_p),
+                                            daemon=True
+                                        ).start()
+
+        except Exception:
+            log.debug(f"Monitor loop error: {traceback.format_exc()}")
+
+        time.sleep(10)
+
+threading.Thread(target=_position_monitor, daemon=True).start()
+
 # ═══════════════════════════════════════════════════════════════════
 # API
 # ═══════════════════════════════════════════════════════════════════
